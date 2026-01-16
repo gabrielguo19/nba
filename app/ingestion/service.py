@@ -96,30 +96,73 @@ class IngestionService:
             logger.warning(f"No games found for {game_date}")
             return 0
         
+        logger.info(f"Fetched {len(raw_games)} games from API")
+        
         # Get ID mappings for foreign keys
         repo = Repository(self.session)
         
+        # Get or create season for this date
+        season = repo.seasons.get_season_for_date(game_date)
+        logger.info(f"Using season: {season.year_start}-{season.year_end} (ID: {season.season_id})")
+        season_map = {str(season.year_start): season.season_id}
+        
         # Get team mappings (name -> UUID)
-        repo = Repository(self.session)
         team_map = repo.teams.get_name_to_uuid_map()
+        logger.info(f"Found {len(team_map)} teams in database")
         
         # Build team ID to name mapping from nba_api static data
         from nba_api.stats.static import teams
         teams_static = teams.get_teams()
         team_id_to_name_map = {team["id"]: team["full_name"] for team in teams_static}
+        logger.info(f"Mapped {len(team_id_to_name_map)} external team IDs to names")
         
         # Transform to DataFrame
         games_df = self.transformer.games_to_dataframe(
             raw_games,
+            season_map=season_map,
             team_map=team_map,
             team_id_to_name_map=team_id_to_name_map
         )
         
-        # Persist to database
-        repo.games.bulk_insert_from_dataframe(games_df)
+        if games_df.empty:
+            logger.warning("Games DataFrame is empty after transformation")
+            return 0
         
-        logger.info(f"Successfully ingested {len(games_df)} games for {game_date}")
-        return len(games_df)
+        # Check for missing team mappings
+        missing_home = games_df[games_df["home_team_id"].isna()]
+        missing_away = games_df[games_df["away_team_id"].isna()]
+        if not missing_home.empty:
+            logger.warning(f"{len(missing_home)} games have missing home_team_id")
+        if not missing_away.empty:
+            logger.warning(f"{len(missing_away)} games have missing away_team_id")
+        
+        # Filter out games with missing required fields
+        games_df_valid = games_df[
+            games_df["home_team_id"].notna() & 
+            games_df["away_team_id"].notna() &
+            games_df["season_id"].notna()
+        ]
+        
+        if len(games_df_valid) < len(games_df):
+            logger.warning(f"Filtered out {len(games_df) - len(games_df_valid)} games with missing required fields")
+        
+        if games_df_valid.empty:
+            logger.error("No valid games to insert after filtering")
+            return 0
+        
+        # Persist to database
+        logger.info(f"About to insert {len(games_df_valid)} valid games into database...")
+        logger.debug(f"Sample game data: {games_df_valid[['game_id', 'home_team_id', 'away_team_id', 'season_id']].head(2).to_dict()}")
+        
+        try:
+            repo.games.bulk_insert_from_dataframe(games_df_valid)
+            logger.info(f"✅ Successfully ingested {len(games_df_valid)} games for {game_date}")
+            return len(games_df_valid)
+        except Exception as e:
+            logger.error(f"❌ Error inserting games: {e}")
+            import traceback
+            logger.error(traceback.format_exc())
+            raise
     
     async def ingest_box_scores_for_date(self, game_date: date) -> int:
         """Ingest box scores for all games on a specific date"""
@@ -153,16 +196,38 @@ class IngestionService:
         team_id_to_name_map = {team["id"]: team["full_name"] for team in teams_static}
         
         # Get game mappings (external game_id -> UUID)
-        # Query games by date to get UUIDs
+        # Query games by date to get UUIDs and team info for matching
         from sqlalchemy import text, select
         from app.persistence.models import Game
-        stmt = select(Game.game_id, Game.game_date).where(
+        from datetime import timedelta
+        stmt = select(Game.game_id, Game.game_date, Game.home_team_id, Game.away_team_id).where(
             Game.game_date >= datetime.combine(game_date, datetime.min.time()),
             Game.game_date < datetime.combine(game_date + timedelta(days=1), datetime.min.time())
         )
         games_result = self.session.execute(stmt).all()
-        # Create mapping: we'll match by date for now since external IDs aren't stored
-        game_map = {}  # Will be populated by matching game dates
+        
+        # Build game_map by matching external game_id with database games
+        # Match by home_team_id and away_team_id since we don't store external IDs
+        game_map = {}
+        for db_game in games_result:
+            db_game_id, db_game_date, db_home_team_id, db_away_team_id = db_game
+            # Find matching raw game by teams
+            for raw_game in raw_games:
+                # Get team UUIDs for raw game
+                raw_home_team_name = team_id_to_name_map.get(raw_game.home_team_id)
+                raw_away_team_name = team_id_to_name_map.get(raw_game.away_team_id)
+                raw_home_uuid = team_map.get(raw_home_team_name) if raw_home_team_name else None
+                raw_away_uuid = team_map.get(raw_away_team_name) if raw_away_team_name else None
+                
+                # Match if teams match (order matters: home/away)
+                if (raw_home_uuid == db_home_team_id and raw_away_uuid == db_away_team_id):
+                    game_map[raw_game.game_id] = db_game_id
+                    logger.debug(f"Mapped external game_id {raw_game.game_id} to UUID {db_game_id}")
+                    break
+        
+        logger.info(f"Built game_map with {len(game_map)} games")
+        if len(game_map) < len(raw_games):
+            logger.warning(f"Could not map {len(raw_games) - len(game_map)} games - some stats may have NULL game_id")
         
         # Fetch box scores for each game
         all_stats = []
@@ -191,8 +256,32 @@ class IngestionService:
             team_id_to_name_map=team_id_to_name_map
         )
         
+        if stats_df.empty:
+            logger.warning("No stats DataFrame created")
+            return 0
+        
+        # Filter out stats with missing required fields (game_id and player_id)
+        stats_df_valid = stats_df[
+            stats_df["game_id"].notna() & 
+            stats_df["player_id"].notna()
+        ]
+        
+        missing_game_id = len(stats_df[stats_df["game_id"].isna()])
+        missing_player_id = len(stats_df[stats_df["player_id"].isna()])
+        
+        if missing_game_id > 0:
+            logger.warning(f"Filtered out {missing_game_id} stats with missing game_id")
+        if missing_player_id > 0:
+            logger.warning(f"Filtered out {missing_player_id} stats with missing player_id (players not in database)")
+        
+        if stats_df_valid.empty:
+            logger.error("No valid stats to insert after filtering")
+            return 0
+        
+        logger.info(f"Inserting {len(stats_df_valid)} valid player stats (filtered {len(stats_df) - len(stats_df_valid)} invalid)")
+        
         # Persist to database
-        repo.player_stats.bulk_insert_from_dataframe(stats_df)
+        repo.player_stats.bulk_insert_from_dataframe(stats_df_valid)
         
         logger.info(f"Successfully ingested {len(stats_df)} player stats for {game_date}")
         return len(stats_df)
@@ -201,9 +290,14 @@ class IngestionService:
         """Ingest injury reports from web scraping"""
         logger.info("Starting injury report ingestion...")
         
-        # Scrape injuries
-        async with InjuryScraper(headless=True) as scraper:
-            raw_injuries = await scraper.scrape_all_sources()
+        try:
+            # Scrape injuries
+            async with InjuryScraper(headless=True) as scraper:
+                raw_injuries = await scraper.scrape_all_sources()
+        except Exception as e:
+            logger.error(f"Failed to scrape injuries (Playwright may need setup): {e}")
+            logger.info("Skipping injury ingestion. Run 'playwright install' to enable scraping.")
+            return 0
         
         if not raw_injuries:
             logger.warning("No injuries scraped")

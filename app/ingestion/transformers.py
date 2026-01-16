@@ -98,9 +98,29 @@ class DataTransformer:
             except ValueError:
                 game_uuid = uuid4()
             
+            # Get season_id from season_map (keyed by year_start as string)
+            # If game has season_id, use it; otherwise derive from game_date
+            season_uuid = None
+            if season_map:
+                if game.season_id:
+                    season_uuid = season_map.get(str(game.season_id))
+                else:
+                    # Derive season from game_date (NBA seasons: Oct-June)
+                    from datetime import date
+                    if isinstance(game.game_date, date):
+                        year = game.game_date.year
+                        month = game.game_date.month
+                    else:
+                        year = game.game_date.year
+                        month = game.game_date.month
+                    
+                    # If month >= 10, season starts that year; else previous year
+                    year_start = year if month >= 10 else year - 1
+                    season_uuid = season_map.get(str(year_start))
+            
             data.append({
                 "game_id": game_uuid,
-                "season_id": season_map.get(game.season_id) if game.season_id and season_map else None,
+                "season_id": season_uuid,
                 "game_date": game.game_date,
                 "home_team_id": home_team_uuid,
                 "away_team_id": away_team_uuid,

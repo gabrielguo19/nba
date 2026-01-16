@@ -16,13 +16,13 @@ logger = logging.getLogger(__name__)
 class InjuryScraper:
     """Scrape NBA injury reports using Playwright"""
     
-    def __init__(self, headless: bool = True, timeout: int = 30000):
+    def __init__(self, headless: bool = True, timeout: int = 60000):
         """
         Initialize injury scraper
         
         Args:
             headless: Run browser in headless mode
-            timeout: Page load timeout in milliseconds
+            timeout: Page load timeout in milliseconds (default 60 seconds)
         """
         self.headless = headless
         self.timeout = timeout
@@ -31,9 +31,14 @@ class InjuryScraper:
     
     async def __aenter__(self):
         """Async context manager entry"""
-        self.playwright = await async_playwright().start()
-        self.browser = await self.playwright.chromium.launch(headless=self.headless)
-        return self
+        try:
+            self.playwright = await async_playwright().start()
+            self.browser = await self.playwright.chromium.launch(headless=self.headless)
+            return self
+        except Exception as e:
+            logger.error(f"Failed to launch browser: {e}")
+            logger.error("Please run 'playwright install' to install browsers")
+            raise
     
     async def __aexit__(self, exc_type, exc_val, exc_tb):
         """Async context manager exit"""
@@ -55,10 +60,19 @@ class InjuryScraper:
             url = "https://www.espn.com/nba/injuries"
             logger.info(f"Scraping injuries from {url}")
             
-            await page.goto(url, wait_until="networkidle", timeout=self.timeout)
+            # Use domcontentloaded instead of networkidle for faster loading
+            await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout)
             
-            # Wait for injury table to load
-            await page.wait_for_selector("table", timeout=self.timeout)
+            # Wait for injury table to load with retry
+            try:
+                await page.wait_for_selector("table", timeout=10000, state="attached")
+            except PlaywrightTimeoutError:
+                # Try alternative selector
+                try:
+                    await page.wait_for_selector(".Table", timeout=10000)
+                except PlaywrightTimeoutError:
+                    logger.warning("Could not find injury table, trying to extract from page content")
+                    # Continue anyway, might still have data
             
             # Extract injury data from table
             injury_rows = await page.query_selector_all("tbody tr")
@@ -120,10 +134,19 @@ class InjuryScraper:
             url = "https://www.rotowire.com/basketball/injury-report.php"
             logger.info(f"Scraping injuries from {url}")
             
-            await page.goto(url, wait_until="networkidle", timeout=self.timeout)
+            # Use domcontentloaded instead of networkidle for faster loading
+            await page.goto(url, wait_until="domcontentloaded", timeout=self.timeout)
             
-            # Wait for injury table
-            await page.wait_for_selector("table.injury-table", timeout=self.timeout)
+            # Wait for injury table with shorter timeout and retry
+            try:
+                await page.wait_for_selector("table.injury-table", timeout=10000, state="attached")
+            except PlaywrightTimeoutError:
+                # Try alternative selector
+                try:
+                    await page.wait_for_selector("table", timeout=10000)
+                except PlaywrightTimeoutError:
+                    logger.warning("Could not find Rotowire injury table, continuing anyway")
+                    # Continue anyway
             
             # Extract injury data
             injury_rows = await page.query_selector_all("tbody tr")

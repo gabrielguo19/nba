@@ -5,6 +5,8 @@ import logging
 from datetime import datetime, date
 from typing import List, Optional, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
+import pandas as pd
+import requests
 
 from nba_api.stats.endpoints import (
     boxscoretraditionalv2,
@@ -86,8 +88,7 @@ class NBAAPIClient:
         """Fetch detailed player information"""
         try:
             player_info = await self._run_in_executor(
-                commonplayerinfo.CommonPlayerInfo,
-                player_id=player_id
+                lambda: commonplayerinfo.CommonPlayerInfo(player_id=player_id)
             )
             info = player_info.get_dict()["resultSets"][0]["rowSet"]
             if not info:
@@ -109,36 +110,120 @@ class NBAAPIClient:
     async def get_scoreboard(self, game_date: date) -> List[RawGameData]:
         """Fetch scoreboard for a specific date"""
         try:
-            scoreboard = await self._run_in_executor(
-                scoreboardv2.ScoreboardV2,
-                game_date=game_date.strftime("%m/%d/%Y")
-            )
-            data = scoreboard.get_dict()
+            date_str = game_date.strftime("%m/%d/%Y")
+            logger.debug(f"Fetching scoreboard for date: {date_str}")
             
-            # Extract game data from scoreboard
-            games = []
-            if "resultSets" in data and len(data["resultSets"]) > 0:
-                game_header = data["resultSets"][0]
-                if "rowSet" in game_header:
-                    for game_row in game_header["rowSet"]:
-                        try:
-                            games.append(RawGameData(
-                                game_id=str(game_row[2]),  # GAME_ID
-                                game_date=datetime.strptime(
-                                    f"{game_row[0]} {game_row[1]}",
-                                    "%Y-%m-%d %H:%M:%S"
-                                ),
-                                home_team_id=game_row[6],  # HOME_TEAM_ID
-                                away_team_id=game_row[7],  # VISITOR_TEAM_ID
-                                is_playoffs=game_row[8] == 1,  # GAME_STATUS_ID
-                                status=game_row[4]  # GAME_STATUS_TEXT
-                            ))
-                        except (IndexError, ValueError) as e:
-                            logger.warning(f"Error parsing game data: {e}")
-                            continue
+            # Direct API call to bypass nba_api library issues
+            url = "https://stats.nba.com/stats/scoreboardV2"
+            params = {
+                "GameDate": date_str,
+                "LeagueID": "00",
+                "DayOffset": "0"
+            }
+            headers = {
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36',
+                'Referer': 'https://www.nba.com/',
+                'Accept': 'application/json',
+                'Accept-Language': 'en-US,en;q=0.9'
+            }
             
-            logger.info(f"Fetched {len(games)} games for {game_date}")
-            return games
+            try:
+                response = await self._run_in_executor(
+                    lambda: requests.get(url, params=params, headers=headers, timeout=10)
+                )
+                response.raise_for_status()
+                data = response.json()
+                
+                games = []
+                if "resultSets" in data and len(data["resultSets"]) > 0:
+                    game_header = data["resultSets"][0]
+                    if "rowSet" in game_header and game_header["rowSet"]:
+                        for game_row in game_header["rowSet"]:
+                            try:
+                                if len(game_row) < 8:
+                                    logger.debug(f"Game row too short: {len(game_row)} columns")
+                                    continue
+                                
+                                # Parse date - API returns '2024-12-15T00:00:00' format
+                                game_date_str = str(game_row[0])  # GAME_DATE_EST
+                                if 'T' in game_date_str:
+                                    # Handle ISO format: '2024-12-15T00:00:00'
+                                    game_date_parsed = datetime.strptime(game_date_str.split('T')[0], "%Y-%m-%d")
+                                else:
+                                    # Fallback to other formats
+                                    try:
+                                        game_date_parsed = datetime.strptime(game_date_str, "%Y-%m-%d %H:%M:%S")
+                                    except ValueError:
+                                        game_date_parsed = datetime.strptime(game_date_str, "%Y-%m-%d")
+                                
+                                # Determine if playoffs from game_id format: 0022401216
+                                # Format: 002 + 24 (season) + 0/1 (game type) + 1216 (game num)
+                                # 0 = Regular Season, 1 = Playoffs
+                                game_id_str = str(game_row[2])
+                                is_playoffs = False
+                                if len(game_id_str) >= 5:
+                                    game_type_char = game_id_str[4]  # 5th character (0-indexed)
+                                    is_playoffs = game_type_char == '1'
+                                
+                                games.append(RawGameData(
+                                    game_id=game_id_str,  # GAME_ID (index 2)
+                                    game_date=game_date_parsed,
+                                    home_team_id=int(game_row[6]) if len(game_row) > 6 and game_row[6] else None,  # HOME_TEAM_ID (index 6)
+                                    away_team_id=int(game_row[7]) if len(game_row) > 7 and game_row[7] else None,  # VISITOR_TEAM_ID (index 7)
+                                    is_playoffs=is_playoffs,
+                                    status=str(game_row[4]) if len(game_row) > 4 and game_row[4] else "Unknown"  # GAME_STATUS_TEXT (index 4)
+                                ))
+                            except (IndexError, ValueError, TypeError) as e:
+                                logger.warning(f"Error parsing game row: {e}, row length: {len(game_row) if hasattr(game_row, '__len__') else 'N/A'}")
+                                continue
+                
+                if games:
+                    logger.info(f"Fetched {len(games)} games for {game_date} using direct API call")
+                    return games
+                else:
+                    logger.info(f"No games found for {game_date}")
+                    return []
+                    
+            except requests.RequestException as e:
+                logger.warning(f"Direct API call failed: {e}, trying nba_api library as fallback")
+                # Fallback to nba_api library (will likely fail but try anyway)
+                try:
+                    scoreboard = await self._run_in_executor(
+                        lambda: scoreboardv2.ScoreboardV2(game_date=date_str)
+                    )
+                    # If we get here, try to extract data
+                    try:
+                        dfs = await self._run_in_executor(lambda: scoreboard.get_data_frames())
+                        if dfs and len(dfs) > 0 and not dfs[0].empty:
+                            games = []
+                            for idx, row in dfs[0].iterrows():
+                                try:
+                                    games.append(RawGameData(
+                                        game_id=str(row.get('GAME_ID', '')),
+                                        game_date=datetime.strptime(
+                                            f"{row.get('GAME_DATE_EST', '')} {row.get('GAME_TIME_EST', '00:00:00')}",
+                                            "%Y-%m-%d %H:%M:%S"
+                                        ) if row.get('GAME_DATE_EST') else datetime.now(),
+                                        home_team_id=int(row.get('HOME_TEAM_ID', 0)) if pd.notna(row.get('HOME_TEAM_ID')) else None,
+                                        away_team_id=int(row.get('VISITOR_TEAM_ID', 0)) if pd.notna(row.get('VISITOR_TEAM_ID')) else None,
+                                        is_playoffs=int(row.get('GAME_STATUS_ID', 0)) == 1,
+                                        status=str(row.get('GAME_STATUS_TEXT', 'Unknown'))
+                                    ))
+                                except Exception as parse_err:
+                                    logger.debug(f"Error parsing row: {parse_err}")
+                                    continue
+                            if games:
+                                logger.info(f"Fetched {len(games)} games using nba_api fallback")
+                                return games
+                    except Exception:
+                        pass
+                    return []
+                except KeyError as ke:
+                    if 'WinProbability' in str(ke):
+                        logger.warning(f"nba_api library failed with WinProbability error")
+                        return []
+                    raise
+                        
         except Exception as e:
             logger.error(f"Error fetching scoreboard for {game_date}: {e}")
             return []
@@ -147,8 +232,7 @@ class NBAAPIClient:
         """Fetch box score for a specific game"""
         try:
             box_score = await self._run_in_executor(
-                boxscoretraditionalv2.BoxScoreTraditionalV2,
-                game_id=game_id
+                lambda: boxscoretraditionalv2.BoxScoreTraditionalV2(game_id=game_id)
             )
             data = box_score.get_dict()
             
@@ -210,9 +294,7 @@ class NBAAPIClient:
         """Fetch game log for a specific player"""
         try:
             game_log = await self._run_in_executor(
-                playergamelog.PlayerGameLog,
-                player_id=player_id,
-                season=season
+                lambda: playergamelog.PlayerGameLog(player_id=player_id, season=season)
             )
             data = game_log.get_dict()
             

@@ -299,16 +299,16 @@ class InjuryReport(Base):
         primary_key=True,
         default=uuid4
     )
-    player_id: Mapped[UUID] = mapped_column(
+    player_id: Mapped[Optional[UUID]] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("players.player_id"),
-        nullable=False,
+        nullable=True,  # Allow NULL for unmatched players
         index=True
     )
-    team_id: Mapped[UUID] = mapped_column(
+    team_id: Mapped[Optional[UUID]] = mapped_column(
         UUID(as_uuid=True),
         ForeignKey("teams.team_id"),
-        nullable=False,
+        nullable=True,  # Allow NULL for unmatched teams
         index=True
     )
     reported_at: Mapped[datetime] = mapped_column(
