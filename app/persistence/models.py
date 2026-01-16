@@ -206,9 +206,9 @@ class Game(Base):
     )
 
     # Composite index for time-series queries
-    # Unique constraint on game_id for foreign key references (needed even with composite PK)
+    # Note: No unique constraint on game_id alone - TimescaleDB requires partitioning column in unique constraints
+    # Foreign keys will reference the composite key (game_id, game_date)
     __table_args__ = (
-        UniqueConstraint("game_id", name="uq_games_game_id"),
         Index("idx_games_date_team", "game_date", "home_team_id", "away_team_id"),
     )
 
