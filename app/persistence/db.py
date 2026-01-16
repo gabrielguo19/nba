@@ -89,15 +89,7 @@ class Database:
         logger.info("Creating TimescaleDB hypertables...")
 
         # Create hypertables in separate transactions
-        # Note: We'll drop and recreate the unique constraint after creating hypertables
         # Convert games table to hypertable
-        # First, temporarily drop the unique constraint (TimescaleDB needs partitioning column in PK)
-        with self.engine.begin() as conn:
-            try:
-                conn.execute(text("ALTER TABLE games DROP CONSTRAINT IF EXISTS uq_games_game_id;"))
-            except Exception:
-                pass
-        
         with self.engine.begin() as conn:
             try:
                 conn.execute(text("""
@@ -109,8 +101,6 @@ class Database:
                     );
                 """))
                 logger.info("Created hypertable: games")
-                # Re-add unique constraint on game_id for foreign key references
-                conn.execute(text("ALTER TABLE games ADD CONSTRAINT uq_games_game_id UNIQUE (game_id);"))
             except Exception as e:
                 logger.warning(f"Could not create hypertable for games: {e}")
                 # Check if it already exists
@@ -121,11 +111,6 @@ class Database:
                     """))
                     if result.scalar() > 0:
                         logger.info("Hypertable 'games' already exists")
-                        # Ensure unique constraint exists
-                        try:
-                            conn.execute(text("ALTER TABLE games ADD CONSTRAINT uq_games_game_id UNIQUE (game_id);"))
-                        except Exception:
-                            pass  # Constraint may already exist
                 except Exception:
                     pass
 

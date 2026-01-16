@@ -9,6 +9,7 @@ from sqlalchemy import (
     Date,
     Float,
     ForeignKey,
+    ForeignKeyConstraint,
     Integer,
     String,
     Text,
@@ -227,7 +228,8 @@ class PlayerGameStats(Base):
     )
     game_id: Mapped[UUID] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("games.game_id"),
+        # Note: No FK constraint - TimescaleDB hypertables don't support FKs to non-partitioning columns
+        # Referential integrity maintained at application level
         nullable=False,
         index=True
     )
@@ -272,8 +274,14 @@ class PlayerGameStats(Base):
     player: Mapped["Player"] = relationship(back_populates="game_stats")
     team: Mapped["Team"] = relationship(back_populates="player_stats")
 
+    # Composite foreign key to games table (both game_id and game_date required for TimescaleDB)
     # Unique constraint to prevent duplicate stats (game_date is now in PK)
     __table_args__ = (
+        ForeignKeyConstraint(
+            ["game_id", "game_date"],
+            ["games.game_id", "games.game_date"],
+            name="fk_player_game_stats_game"
+        ),
         UniqueConstraint("player_id", "game_id", name="uq_player_game_stats"),
         Index("idx_player_game_stats_player_date", "player_id", "game_date"),
     )
@@ -354,7 +362,8 @@ class VarianceSnapshot(Base):
     )
     game_id: Mapped[UUID] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("games.game_id"),
+        # Note: No FK constraint - TimescaleDB hypertables don't support FKs to non-partitioning columns
+        # Referential integrity maintained at application level
         nullable=False,
         index=True
     )
@@ -389,7 +398,8 @@ class UsageRateChange(Base):
     )
     game_id: Mapped[UUID] = mapped_column(
         UUID(as_uuid=True),
-        ForeignKey("games.game_id"),
+        # Note: No FK constraint - TimescaleDB hypertables don't support FKs to non-partitioning columns
+        # Referential integrity maintained at application level
         nullable=False,
         index=True
     )
