@@ -6,7 +6,6 @@ from datetime import datetime, date
 from typing import List, Optional, Dict, Any
 from concurrent.futures import ThreadPoolExecutor
 
-from nba_api.live.nba.endpoints import Scoreboard
 from nba_api.stats.endpoints import (
     boxscoretraditionalv2,
     playergamelog,
