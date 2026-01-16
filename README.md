@@ -81,11 +81,13 @@ The database initialization script creates all tables and converts time-series t
 ```bash
 python scripts/init_db.py
 ```
+<img width="825" height="813" alt="image" src="https://github.com/user-attachments/assets/a703333a-4835-4dff-964d-5fea36193f0d" />
 
 This will:
 1. Create all SQLAlchemy models as database tables
 2. Enable the TimescaleDB extension
 3. Convert `games`, `player_game_stats`, and `injury_reports` to hypertables
+
 
 ## License
 
